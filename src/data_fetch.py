@@ -34,6 +34,15 @@ BASE_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CACHE_DIR = BASE_DATA_DIR / "cache"
 SAMPLE_DIR = BASE_DATA_DIR / "sample_data"
 
+ECB_API = "https://data-api.ecb.europa.eu/service/data"
+OECD_BASE = "https://stats.oecd.org/sdmx-json/data"
+FRED_RETAIL = {
+    "US": "RSAFS",
+    "EU": "RSIEURO",
+    "CN": "CHNRSCYOY",
+    "IN": "INDRSTYOY",
+}
+
 
 def safe_fetch(fetch_func, *args, **kwargs):
     """Call ``fetch_func`` with retries and return a DataFrame on success."""
@@ -78,6 +87,23 @@ def safe_fetch(fetch_func, *args, **kwargs):
     return pd.DataFrame()
 
 
+def pick_close(df: pd.DataFrame) -> pd.Series:
+    """Select the best available close column from a Yahoo Finance frame."""
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = ["_".join([c for c in col if c]) for col in df.columns.values]
+    for col in ["Adj Close", "Adjusted Close", "Close", "close"]:
+        if col in df.columns:
+            series = df[col].copy()
+            series.name = "close"
+            return series
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if num_cols:
+        return df[num_cols[0]].rename("close")
+    return pd.Series(dtype=float, name="close")
+
+
 def load_cached_or_sample(name: str) -> pd.DataFrame:
     """Return cached CSV if available, otherwise load sample data."""
 
@@ -91,6 +117,230 @@ def load_cached_or_sample(name: str) -> pd.DataFrame:
             except Exception as exc:  # pragma: no cover - corrupt file
                 print(f"[WARN] Failed to load fallback data from {path}: {exc}")
     return pd.DataFrame()
+
+
+def fetch_ecb_total_assets(last_n: int = 520) -> pd.DataFrame:
+    """Retrieve Eurosystem or broader ECB balance sheet totals."""
+
+    ilm_key = "ILM.W.U2.C.T000000.Z5.Z01"
+    bsi_key = "BSI.M.U2.N.A.A20.A.1.U2.0000.Z01.E"
+
+    for key in (ilm_key, bsi_key):
+        url = f"{ECB_API}/{key}?lastNObservations={last_n}&format=jsondata"
+        try:
+            df = safe_fetch(pd.read_json, url, _description=f"ECB JSON {key}", _max_attempts=1)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                if "date" in df.columns and "value" in df.columns:
+                    frame = df.copy()
+                    frame["date"] = pd.to_datetime(frame["date"])
+                    frame = frame.set_index("date").sort_index()
+                else:
+                    frame = df
+                if not frame.empty:
+                    latest = frame.dropna().index.max() if isinstance(frame.index, pd.DatetimeIndex) else None
+                    latest_fmt = latest.date() if isinstance(latest, pd.Timestamp) else "N/A"
+                    print(f"[OK] ECB: {key} fetched (latest={latest_fmt}, rows={len(frame)})")
+                    return frame
+
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            obs = []
+            series = data.get("data", {}).get("dataSets", [{}])[0].get("series", {})
+            dims = data.get("data", {}).get("structure", {}).get("dimensions", {}).get("observation", [])
+            if not dims:
+                raise ValueError("No observation dimensions present")
+            time_values = [v.get("name") for v in dims[0].get("values", [])]
+            for _, s_val in series.items():
+                for obs_key, obs_val in s_val.get("observations", {}).items():
+                    idx = int(obs_key)
+                    if idx >= len(time_values):
+                        continue
+                    timestamp = pd.to_datetime(time_values[idx])
+                    value = obs_val[0] if isinstance(obs_val, (list, tuple)) else obs_val
+                    obs.append((timestamp, float(value)))
+            frame = pd.DataFrame(obs, columns=["date", "value"]).set_index("date").sort_index()
+            if not frame.empty:
+                latest = frame.index.max()
+                latest_fmt = latest.date() if pd.notna(latest) else "N/A"
+                print(f"[OK] ECB: {key} fetched (latest={latest_fmt}, rows={len(frame)})")
+                return frame
+        except Exception as exc:  # pragma: no cover - network dependent
+            print(f"[WARN] ECB: {key} failed: {exc}")
+
+    print("[INFO] Falling back to cached/sample ecb_assets")
+    return load_cached_or_sample("ecb_assets")
+
+
+def fetch_china_broad_money() -> pd.DataFrame:
+    """Fetch China broad money (M3) series from FRED."""
+
+    if web is None:
+        print("[WARN] pandas-datareader not installed; cannot fetch China broad money")
+        return load_cached_or_sample("china_broad_money")
+
+    try_ids = ["MABMM301CNM189S", "MABMM301CNA189S"]
+    for sid in try_ids:
+        try:
+            df = safe_fetch(
+                web.DataReader,
+                sid,
+                "fred",
+                start="1999-01-01",
+                _description=f"FRED China broad money {sid}",
+            )
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                frame = df.rename(columns={sid: "value"}).sort_index()
+                latest = frame.dropna().index.max()
+                latest_fmt = latest.date() if pd.notna(latest) else "N/A"
+                print(
+                    f"[OK] FRED China broad money: {sid} (latest={latest_fmt}, rows={len(frame)})"
+                )
+                return frame
+        except Exception as exc:  # pragma: no cover - network dependent
+            print(f"[WARN] FRED China broad money failed for {sid}: {exc}")
+
+    print("[INFO] Falling back to cached/sample china_broad_money")
+    return load_cached_or_sample("china_broad_money")
+
+
+def fetch_oecd(dataset: str, filter_path: str = "all/all", params: str = "contentType=csv") -> pd.DataFrame:
+    """Retrieve OECD SDMX datasets via HTTPS."""
+
+    url = f"{OECD_BASE}/{dataset}/{filter_path}?{params}"
+    try:
+        df = safe_fetch(pd.read_csv, url, _description=f"OECD: {dataset}", _max_attempts=1)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            print(f"[OK] OECD: {dataset} fetched (rows={len(df)})")
+            return df
+    except Exception as exc:  # pragma: no cover - network dependent
+        print(f"[WARN] OECD fetch failed for {dataset}: {exc}")
+
+    print(f"[INFO] Falling back to cached/sample oecd_{dataset.lower()}")
+    return load_cached_or_sample(f"oecd_{dataset.lower()}")
+
+
+def fetch_retail_sales(series_map: Dict[str, str] | None = None) -> Dict[str, pd.Series]:
+    """Fetch retail sales series from FRED with graceful fallbacks."""
+
+    if series_map is None:
+        series_map = FRED_RETAIL
+
+    series_map = {k: v for k, v in (series_map or {}).items() if v}
+    if not series_map:
+        print("[INFO] No retail sales symbols provided")
+        return {}
+
+    results: Dict[str, pd.Series] = {}
+    if web is None:
+        print("[WARN] pandas-datareader not installed; using fallback retail sales data")
+        for region in series_map:
+            fb = load_cached_or_sample(f"retail_{region.lower()}")
+            if not fb.empty:
+                if isinstance(fb, pd.Series):
+                    series = fb.copy()
+                elif "value" in fb.columns:
+                    series = fb["value"]
+                else:
+                    series = fb.iloc[:, 0]
+                series.name = region
+                results[region] = series.sort_index()
+        return results
+
+    from pandas_datareader._utils import RemoteDataError  # type: ignore
+
+    for region, sid in series_map.items():
+        try:
+            df = safe_fetch(
+                web.DataReader,
+                sid,
+                "fred",
+                start="2000-01-01",
+                _description=f"Retail sales {region}/{sid}",
+            )
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                frame = df.rename(columns={sid: "value"}).sort_index()
+                series = frame["value"].astype(float)
+                latest = series.dropna().index.max()
+                latest_fmt = latest.date() if pd.notna(latest) else "N/A"
+                print(
+                    f"[OK] Retail (FRED): {region}/{sid} (latest={latest_fmt}, rows={len(series)})"
+                )
+                results[region] = series
+                continue
+        except (Exception, RemoteDataError) as exc:  # pragma: no cover - network dependent
+            print(f"[WARN] Retail sales fetch failed for {region}/{sid}: {exc}")
+
+        fb = load_cached_or_sample(f"retail_{region.lower()}")
+        if not fb.empty:
+            if isinstance(fb, pd.Series):
+                series = fb.copy()
+            elif "value" in fb.columns:
+                series = fb["value"]
+            else:
+                series = fb.iloc[:, 0]
+            series = series.sort_index()
+            series.name = region
+            print(f"[INFO] Using fallback retail for {region}")
+            results[region] = series
+
+    if not results:
+        print("[INFO] No retail sales data fetched")
+    return results
+
+
+_fetch_retail_sales_helper = fetch_retail_sales
+
+
+def fetch_yf_batch(symbols: Iterable[str], start: str = "2000-01-01") -> Dict[str, pd.Series]:
+    """Batch download Yahoo Finance series and return close columns."""
+
+    symbols = [s.strip() for s in symbols if isinstance(s, str) and s.strip()]
+    if not symbols:
+        print("[INFO] Yahoo Finance: empty symbol list, skipping")
+        return {}
+
+    try:
+        data = safe_fetch(
+            yf.download,
+            tickers=" ".join(symbols),
+            start=start,
+            progress=False,
+            auto_adjust=False,
+            _description=f"Yahoo Finance batch {','.join(symbols)}",
+        )
+    except Exception as exc:  # pragma: no cover - network dependent
+        print(f"[WARN] Yahoo Finance batch failed: {exc}")
+        return {}
+
+    results: Dict[str, pd.Series] = {}
+    if isinstance(data, pd.DataFrame) and not data.empty:
+        if isinstance(data.columns, pd.MultiIndex):
+            available = set(data.columns.get_level_values(-1))
+            for symbol in symbols:
+                if symbol not in available:
+                    continue
+                sub = data.xs(symbol, axis=1, level=-1, drop_level=True)
+                series = pick_close(sub)
+                if not series.empty:
+                    results[symbol] = series.sort_index()
+        else:
+            series = pick_close(data)
+            if not series.empty:
+                results[symbols[0]] = series.sort_index()
+
+    if results:
+        latest_candidates = [s.dropna().index.max() for s in results.values() if not s.dropna().empty]
+        latest = max(latest_candidates) if latest_candidates else None
+        latest_fmt = latest.date() if isinstance(latest, pd.Timestamp) else "N/A"
+        rows = sum(len(s.dropna()) for s in results.values())
+        print(
+            f"[OK] Yahoo Finance batch: {','.join(results.keys())} (latest={latest_fmt}, rows={rows})"
+        )
+    else:
+        print(f"[WARN] Yahoo Finance batch returned no data for {','.join(symbols)}")
+
+    return results
 
 
 @dataclass
@@ -190,79 +440,54 @@ class DataFetcher:
 
     def fetch_tga_balance(self) -> pd.Series:
         ticker = self.config.section("creation").get("tga_ticker", "^IRX")
-
-        def _download() -> pd.DataFrame:
-            return yf.download(ticker, period="max", interval="1wk", auto_adjust=False, progress=False)
-
-        data = safe_fetch(_download, _description=f"Yahoo Finance: {ticker}")
-        if data.empty or "Adj Close" not in data:
+        batch = fetch_yf_batch([ticker])
+        series = batch.get(ticker)
+        if series is None or series.empty:
             print(f"[WARN] TGA balance fetch failed for {ticker}; using fallback")
             return self._load_fallback_series("tga_balance", legacy_code="TGA_BALANCE")
 
-        series = data["Adj Close"].dropna().rename("tga_balance")
-        series.index = pd.to_datetime(series.index)
-        latest = series.index.max()
+        result = series.rename("tga_balance").sort_index()
+        latest = result.dropna().index.max()
         latest_fmt = latest.date() if pd.notna(latest) else "N/A"
-        print(f"[OK] Yahoo Finance: {ticker} fetched (latest={latest_fmt})")
-        return series.sort_index()
+        print(f"[OK] TGA balance proxy fetched (latest={latest_fmt}, rows={len(result)})")
+        return result
 
     def fetch_ust_issuance(self) -> pd.Series:
         ticker = self.config.section("creation").get("ust_issuance_ticker", "^TNX")
-
-        def _download() -> pd.DataFrame:
-            return yf.download(ticker, period="max", auto_adjust=False, progress=False)
-
-        data = safe_fetch(_download, _description=f"Yahoo Finance: {ticker}")
-        if data.empty or "Adj Close" not in data:
+        batch = fetch_yf_batch([ticker])
+        series = batch.get(ticker)
+        if series is None or series.empty:
             print(f"[WARN] UST issuance fetch failed for {ticker}; using fallback")
             return self._load_fallback_series("ust_issuance", legacy_code="UST_ISSUANCE")
 
-        series = data["Adj Close"].dropna().rename("ust_issuance")
-        series.index = pd.to_datetime(series.index)
-        latest = series.index.max()
+        result = series.rename("ust_issuance").sort_index()
+        latest = result.dropna().index.max()
         latest_fmt = latest.date() if pd.notna(latest) else "N/A"
-        print(f"[OK] Yahoo Finance: {ticker} fetched (latest={latest_fmt})")
-        return series.sort_index()
+        print(f"[OK] UST issuance proxy fetched (latest={latest_fmt}, rows={len(result)})")
+        return result
 
     def fetch_ecb_total_assets(self) -> pd.Series:
-        series_code = self.config.section("creation").get(
-            "ecb_series", "BSI/M.U2.N.A.A20.A.1.Z5.0000.Z01.E"
-        )
-        url = f"https://data.ecb.europa.eu/service/data/{series_code}"
-
-        def _fetch() -> pd.DataFrame:
-            response = self.session.get(
-                url,
-                params={"lastNObservations": "520", "format": "jsondata"},
-                headers={"Accept": "application/vnd.sdmx.data+json"},
-                timeout=30,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            series_payload = payload.get("dataSets", [{}])[0].get("series", {})
-            if not series_payload:
-                raise ValueError("No ECB series payload returned")
-            series_key = next(iter(series_payload))
-            observations = series_payload.get(series_key, {}).get("observations", {})
-            dates = payload.get("structure", {}).get("dimensions", {}).get("observation", [{}])[0].get("values", [])
-            records: List[tuple[datetime, float]] = []
-            for key, value in observations.items():
-                obs_date = dates[int(key)]["id"]
-                timestamp = pd.Period(obs_date, freq="M").to_timestamp("M")
-                records.append((timestamp, float(value[0])))
-            if not records:
-                raise ValueError("No ECB observations returned")
-            frame = pd.DataFrame(records, columns=["date", "value"]).set_index("date")
-            return frame
-
-        df = safe_fetch(_fetch, _description="ECB: total assets")
+        df = fetch_ecb_total_assets()
         if df.empty:
             return self._load_fallback_series("ecb_assets", legacy_code="ECB_ASSETS")
 
-        series = df["value"].astype(float).rename("ecb_assets").sort_index()
+        if "value" in df.columns:
+            series = df["value"].astype(float)
+        elif isinstance(df, pd.Series):
+            series = df.astype(float)
+        else:
+            first_numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            if first_numeric:
+                series = df[first_numeric[0]].astype(float)
+            else:
+                return self._load_fallback_series("ecb_assets", legacy_code="ECB_ASSETS")
+
+        if not isinstance(series.index, pd.DatetimeIndex):
+            series.index = pd.to_datetime(series.index)
+        series = series.rename("ecb_assets").sort_index()
         latest = series.dropna().index.max()
         latest_fmt = latest.date() if pd.notna(latest) else "N/A"
-        print(f"[OK] ECB: total assets fetched (latest={latest_fmt})")
+        print(f"[OK] ECB total assets prepared (latest={latest_fmt}, rows={len(series)})")
         return series
 
     def fetch_boj_total_assets(self) -> pd.Series:
@@ -304,20 +529,22 @@ class DataFetcher:
             df = pd.read_csv(csv_path, parse_dates=["date"], index_col="date")
             return df.squeeze("columns").rename("pboc_m2")
         print("[WARN] Local PBOC M2 CSV missing; attempting FRED fallback")
-        if web is not None:
-            def _fetch() -> pd.DataFrame:
-                return web.DataReader("MABMM01CNM189S", "fred", start="2000-01-01")
+        df = fetch_china_broad_money()
+        if df.empty:
+            print("[INFO] Falling back to sample data for PBOC M2")
+            return self._load_fallback_series("pboc_m2", legacy_code="PBOC_M2")
 
-            df = safe_fetch(_fetch, _description="FRED: China M2")
-            if not df.empty:
-                series = df.squeeze().astype(float).rename("pboc_m2")
-                series.index = pd.to_datetime(series.index)
-                latest = series.dropna().index.max()
-                latest_fmt = latest.date() if pd.notna(latest) else "N/A"
-                print(f"[OK] FRED: China M2 fetched (latest={latest_fmt})")
-                return series.sort_index()
-        print("[INFO] Falling back to sample data for PBOC M2")
-        return self._load_fallback_series("pboc_m2", legacy_code="PBOC_M2")
+        series = df["value"] if "value" in df.columns else df.iloc[:, 0]
+        if not isinstance(series, pd.Series):
+            series = pd.Series(dtype=float, name="pboc_m2")
+        series = series.astype(float)
+        if not isinstance(series.index, pd.DatetimeIndex):
+            series.index = pd.to_datetime(series.index)
+        series = series.rename("pboc_m2").sort_index()
+        latest = series.dropna().index.max()
+        latest_fmt = latest.date() if pd.notna(latest) else "N/A"
+        print(f"[OK] China broad money prepared (latest={latest_fmt}, rows={len(series)})")
+        return series
 
     def fetch_imf_broad_money(self) -> pd.Series:
         countries: Iterable[str] = self.config.section("creation").get("imf_country_codes", [])
@@ -371,34 +598,34 @@ class DataFetcher:
     # FLOW LAYER FETCHERS
     # ------------------------------------------------------------------
     def fetch_market_series(self, tickers: Iterable[str], column_name: str) -> pd.DataFrame:
-        tickers = [ticker for ticker in set(tickers) if ticker]
+        tickers = [ticker.strip() for ticker in set(tickers) if isinstance(ticker, str) and ticker.strip()]
         if not tickers:
             print(f"[WARN] No tickers supplied for {column_name}")
             return pd.DataFrame()
 
-        def _download() -> pd.DataFrame:
-            return yf.download(tickers, period="max", auto_adjust=True, progress=False)
-
-        data = safe_fetch(_download, _description=f"Yahoo Finance batch: {','.join(tickers)}")
-        if data.empty:
+        data_map = fetch_yf_batch(tickers)
+        if not data_map:
             print(f"[INFO] Falling back to empty DataFrame for {column_name}")
             return pd.DataFrame()
 
-        adj_close = data.get("Adj Close")
-        if adj_close is None or adj_close.empty:
-            print(f"[WARN] Adjusted close not available for {column_name}")
+        frames = []
+        for symbol, series in data_map.items():
+            if series.empty:
+                continue
+            frames.append(series.rename(f"{column_name}_{symbol}"))
+
+        if not frames:
+            print(f"[INFO] No usable Yahoo Finance data for {column_name}")
             return pd.DataFrame()
 
-        if isinstance(adj_close, pd.Series):
-            adj_close = adj_close.to_frame(name=tickers[0])
-
-        adj_close = adj_close.loc[:, ~adj_close.columns.duplicated()].dropna(how="all")
-        adj_close.columns = pd.Index([f"{column_name}_{col}" for col in adj_close.columns], name="field")
-        adj_close.index = pd.to_datetime(adj_close.index)
-        latest = adj_close.dropna(how="all").index.max()
+        combined = pd.concat(frames, axis=1).sort_index()
+        combined.index = pd.to_datetime(combined.index)
+        latest = combined.dropna(how="all").index.max()
         latest_fmt = latest.date() if pd.notna(latest) else "N/A"
-        print(f"[OK] Yahoo Finance batch fetched for {column_name} (latest={latest_fmt})")
-        return adj_close
+        print(
+            f"[OK] Market series prepared for {column_name} (latest={latest_fmt}, rows={len(combined)})"
+        )
+        return combined
 
     def fetch_stablecoin_market_cap(self) -> pd.Series:
         endpoint = self.config.section("flow").get("stablecoin_endpoint")
@@ -485,51 +712,70 @@ class DataFetcher:
             return pd.Series(dtype=float, name=indicator)
 
     def fetch_oecd_series(self, series: str) -> pd.Series:
-        if web is None:
-            print(f"[WARN] pandas-datareader not installed; cannot fetch OECD series {series}")
-            return pd.Series(dtype=float, name=series)
-
-        mapping = {
+        dataset_map = {
             "PMI_NEW_ORDERS": "MEI_PMIO",
             "PMI_INVENTORIES": "MEI_PMII",
             "BCPEBT02": "BCPEBT02",
         }
-        resolved = mapping.get(series, series)
-        try:
-            df = web.DataReader(resolved, "oecd")
-            df = df.squeeze("columns").dropna()
-            df.index = pd.to_datetime(df.index)
-            print(f"[OK] OECD series fetched: {resolved}")
-            return df.rename(resolved)
-        except Exception as exc:
-            print(f"[WARN] OECD fetch failed for {resolved}: {exc}")
-            return pd.Series(dtype=float, name=resolved)
+        dataset = dataset_map.get(series, series)
+        df = fetch_oecd(dataset)
+        if df.empty:
+            print(f"[WARN] OECD dataset empty for {dataset}")
+            return pd.Series(dtype=float, name=dataset)
+
+        frame = df.copy()
+        for column in ["LOCATION", "SUBJECT", "MEASURE", "FREQUENCY"]:
+            if column in frame.columns and frame[column].nunique() > 1:
+                value = frame[column].dropna().iloc[0]
+                frame = frame[frame[column] == value]
+
+        time_col = next(
+            (col for col in ["TIME_PERIOD", "TIME", "Date", "date"] if col in frame.columns),
+            None,
+        )
+        value_col = next(
+            (col for col in ["ObsValue", "OBS_VALUE", "Value", "value"] if col in frame.columns),
+            None,
+        )
+
+        if time_col is None or value_col is None:
+            numeric_cols = [c for c in frame.columns if pd.api.types.is_numeric_dtype(frame[c])]
+            if not numeric_cols:
+                print(f"[WARN] Could not determine OECD value column for {dataset}")
+                return pd.Series(dtype=float, name=dataset)
+            value_col = numeric_cols[0]
+            time_col = time_col or frame.columns[0]
+
+        frame[time_col] = pd.to_datetime(frame[time_col])
+        frame = frame.dropna(subset=[value_col]).sort_values(time_col)
+        series_out = frame.set_index(time_col)[value_col].astype(float)
+        series_out.name = dataset
+        latest = series_out.dropna().index.max()
+        latest_fmt = latest.date() if pd.notna(latest) else "N/A"
+        print(f"[OK] OECD series prepared: {dataset} (latest={latest_fmt}, rows={len(series_out)})")
+        return series_out
 
     def fetch_retail_sales(self, tickers: Dict[str, str]) -> pd.DataFrame:
+        series_map = {region: ticker for region, ticker in (tickers or {}).items() if ticker}
+        data_map = _fetch_retail_sales_helper(series_map if series_map else None)
+        if not data_map:
+            print("[INFO] No retail sales data fetched")
+            return pd.DataFrame()
+
         frames = []
-        for region, ticker in tickers.items():
-            if not ticker:
+        for region, series in data_map.items():
+            if series.empty:
                 continue
-
-            def _download(symbol: str = ticker) -> pd.DataFrame:
-                return yf.download(symbol, period="max", auto_adjust=False, progress=False)
-
-            data = safe_fetch(_download, _description=f"Retail sales: {ticker}")
-            if data.empty or "Adj Close" not in data:
-                print(f"[WARN] Retail sales fetch failed for {ticker}")
-                continue
-
-            series = data["Adj Close"].dropna()
-            series.index = pd.to_datetime(series.index)
             frames.append(series.rename(region))
 
         if not frames:
-            print("[INFO] No retail sales data fetched")
+            print("[INFO] Retail sales inputs empty after fetch")
             return pd.DataFrame()
-        combined = pd.concat(frames, axis=1)
+
+        combined = pd.concat(frames, axis=1).sort_index()
         latest = combined.dropna(how="all").index.max()
         latest_fmt = latest.date() if pd.notna(latest) else "N/A"
-        print(f"[OK] Retail sales data fetched (latest={latest_fmt})")
+        print(f"[OK] Retail sales data prepared (latest={latest_fmt}, rows={len(combined)})")
         return combined
 
     # ------------------------------------------------------------------
@@ -596,4 +842,10 @@ __all__ = [
     "DataFetcher",
     "bootstrap_fetcher",
     "configure_logging",
+    "pick_close",
+    "fetch_ecb_total_assets",
+    "fetch_china_broad_money",
+    "fetch_oecd",
+    "fetch_retail_sales",
+    "fetch_yf_batch",
 ]

@@ -1,8 +1,8 @@
 {
   "creation": {
     "fed_ticker": "WALCL",
-    "tga_ticker": "WTREGEN",
-    "ust_issuance_ticker": "USTBOND",
+    "tga_ticker": "^IRX",
+    "ust_issuance_ticker": "^TNX",
     "ecb_series": "BSI/M.U2.N.A.A20.A.1.Z5.0000.Z01.E",
     "boj_xls_url": "https://www.boj.or.jp/statistics/boj/other/acmai/release/2024/data/ac2401e.xlsx",
     "pboc_local_csv": "data/pboc_m2_sample.csv",
