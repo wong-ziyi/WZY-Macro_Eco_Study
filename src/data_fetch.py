@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - handled gracefully at runtime
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_LOG_LEVEL = logging.INFO
+SAMPLE_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
 @dataclass
@@ -35,12 +36,16 @@ class FetchConfig:
     pca_window: int
     regime_states: int
     scenario_shocks: Dict[str, float]
+    base_dir: Path
 
     @classmethod
     def load(cls, config_path: Path) -> "FetchConfig":
         with config_path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
+        base_dir = config_path.resolve().parent
         outputs_dir = Path(payload.get("outputs", "outputs"))
+        if not outputs_dir.is_absolute():
+            outputs_dir = (base_dir / outputs_dir).resolve()
         outputs_dir.mkdir(parents=True, exist_ok=True)
         return cls(
             raw=payload,
@@ -49,10 +54,19 @@ class FetchConfig:
             pca_window=int(payload.get("pca_window", 36)),
             regime_states=int(payload.get("regime_states", 4)),
             scenario_shocks=payload.get("scenario_shocks", {}),
+            base_dir=base_dir,
         )
 
     def section(self, name: str) -> Dict:
         return self.raw.get(name, {})
+
+    def resolve_path(self, path_str: str) -> Path:
+        """Return ``path_str`` as an absolute :class:`Path`."""
+
+        path = Path(path_str)
+        if path.is_absolute():
+            return path
+        return (self.base_dir / path).resolve()
 
 
 @dataclass
@@ -160,7 +174,8 @@ class DataFetcher:
             return self._fallback_series("BOJ_ASSETS")
 
     def fetch_pboc_m2(self) -> pd.Series:
-        csv_path = Path(self.config.section("creation").get("pboc_local_csv", ""))
+        csv_config = self.config.section("creation").get("pboc_local_csv", "")
+        csv_path = self.config.resolve_path(csv_config) if csv_config else Path()
         if csv_path.exists():
             LOGGER.info("Loading PBOC M2 from local CSV: %s", csv_path)
             df = pd.read_csv(csv_path, parse_dates=["date"], index_col="date")
@@ -232,8 +247,53 @@ class DataFetcher:
         try:
             response = self.session.get(endpoint, timeout=30)
             response.raise_for_status()
-            payload = response.json().get("totalCharts", [])
-            data = {datetime.utcfromtimestamp(point[0] / 1000): point[1] for point in payload}
+            payload = response.json()
+            if isinstance(payload, dict):
+                chart_data = payload.get("totalCharts") or payload.get("charts") or []
+            else:
+                chart_data = payload or []
+
+            records = {}
+            if isinstance(chart_data, dict):
+                iterable = chart_data.items()
+            else:
+                iterable = chart_data
+
+            for point in iterable:
+                timestamp: datetime | None = None
+                value: float | None = None
+                if isinstance(point, tuple) and len(point) == 2:
+                    raw_ts, value = point
+                elif isinstance(point, (list, tuple)) and len(point) >= 2:
+                    raw_ts, value = point[0], point[1]
+                elif isinstance(point, dict):
+                    raw_ts = point.get("date") or point.get("timestamp") or point.get("time")
+                    value = point.get("total") or point.get("totalCirculatingUSD") or point.get("value")
+                else:
+                    continue
+
+                if raw_ts is None or value is None:
+                    continue
+
+                if isinstance(raw_ts, (int, float)):
+                    timestamp = datetime.utcfromtimestamp(raw_ts / (1000 if raw_ts > 10**11 else 1))
+                else:
+                    try:
+                        timestamp = pd.to_datetime(raw_ts).to_pydatetime()
+                    except Exception:  # pragma: no cover - defensive
+                        continue
+
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+
+                records[timestamp] = value
+
+            if not records:
+                raise ValueError("No stablecoin market cap data parsed")
+
+            data = dict(sorted(records.items()))
             series = pd.Series(data).sort_index()
             series.name = "stablecoin_market_cap"
             return series
@@ -289,13 +349,28 @@ class DataFetcher:
     # FALLBACK UTILITIES
     # ------------------------------------------------------------------
     def _fallback_series(self, series_code: str) -> pd.Series:
-        sample_path = Path("data/cb_assets_sample.csv")
+        """Load a fallback series from packaged sample data."""
+
+        sample_map = {
+            "PBOC_M2": ("pboc_m2_sample.csv", None),
+        }
+        file_name, discriminator = sample_map.get(series_code, ("cb_assets_sample.csv", "series"))
+        sample_path = SAMPLE_DATA_DIR / file_name
         if not sample_path.exists():
             LOGGER.error("Fallback sample %s missing", sample_path)
             return pd.Series(dtype=float)
+
         df = pd.read_csv(sample_path, parse_dates=["date"])
-        mask = df["series"] == series_code
-        series = df.loc[mask, ["date", "value"]].set_index("date")["value"].sort_index()
+        if discriminator:
+            mask = df[discriminator] == series_code
+            if not mask.any():
+                LOGGER.error("Series %s not present in fallback file %s", series_code, sample_path)
+                return pd.Series(dtype=float)
+            df = df.loc[mask, ["date", "value"]]
+        else:
+            df = df[["date", "value"]]
+
+        series = df.set_index("date")["value"].sort_index()
         series.name = series_code.lower()
         return series
 
