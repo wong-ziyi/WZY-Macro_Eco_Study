@@ -1,0 +1,84 @@
+{
+  "creation": {
+    "fed_ticker": "WALCL",
+    "tga_ticker": "WTREGEN",
+    "ust_issuance_ticker": "USTBOND",
+    "ecb_series": "BSI/M.U2.N.A.A20.A.1.Z5.0000.Z01.E",
+    "boj_xls_url": "https://www.boj.or.jp/statistics/boj/other/acmai/release/2024/data/ac2401e.xlsx",
+    "pboc_local_csv": "data/pboc_m2_sample.csv",
+    "imf_country_codes": ["US", "EU", "JP", "CN", "GB", "CA", "BR", "IN"],
+    "oecd_fiscal_impulse_series": [
+      "USA_GGEXP_RELATIVE",
+      "EA19_GGEXP_RELATIVE"
+    ]
+  },
+  "flow": {
+    "fx_ticker": "DX-Y.NYB",
+    "rates_ticker": "^TNX",
+    "credit_ticker": "BAMLH0A0HYM2",
+    "equity_tickers": ["SPY", "QQQ", "EEM", "FEZ", "AAXJ", "VNQ"],
+    "bond_tickers": ["AGG", "EMB"],
+    "commodity_tickers": ["CL=F", "GC=F"],
+    "stablecoin_endpoint": "https://stablecoins.llama.fi/stablecoincharts/all"
+  },
+  "utilization": {
+    "world_bank_gfcf_code": "NE.GDI.FTOT.ZS",
+    "oecd_capex_series": "BCPEBT02",
+    "pmi_series": {
+      "new_orders": "PMI_NEW_ORDERS",
+      "inventories": "PMI_INVENTORIES"
+    }
+  },
+  "consumption": {
+    "retail_sales": {
+      "US": "RSAFS",
+      "EU": "RSIEURO",
+      "CN": "CHNRSCYOY",
+      "IN": "INDRSTYOY"
+    },
+    "global_services_pmi": "PMI_SERVICES_GLOBAL",
+    "real_wages_series": [
+      "USA_REAL_WAGE",
+      "EA19_REAL_WAGE"
+    ]
+  },
+  "productivity": {
+    "pwt_url": "https://www.rug.nl/ggdc/docs/pwt100.xlsx",
+    "tfp_indicator": "rtfpna",
+    "labor_productivity_indicator": "cwtfp",
+    "rd_world_bank_code": "GB.XPD.RSDV.GD.ZS",
+    "semi_sales_csv": "data/semiconductor_sales_sample.csv"
+  },
+  "weights": {
+    "creation": 0.3,
+    "flow": 0.3,
+    "utilization": 0.2,
+    "consumption": 0.1,
+    "efficiency": 0.1
+  },
+  "visualization": {
+    "regional_etf_map": {
+      "USA": "SPY",
+      "Europe": "FEZ",
+      "Japan": "EWJ",
+      "Asia ex-Japan": "AAXJ",
+      "China": "MCHI",
+      "India": "INDA",
+      "EmergingMkts": "EEM",
+      "MiddleEast": "GAF",
+      "LatinAmerica": "ILF",
+      "Australia": "EWA",
+      "Canada": "EWC",
+      "Africa": "AFK"
+    }
+  },
+  "outputs": "outputs",
+  "lookback_months": 120,
+  "pca_window": 36,
+  "regime_states": 4,
+  "scenario_shocks": {
+    "ust10y": 0.01,
+    "dxy": 0.1,
+    "stablecoin": -0.1
+  }
+}

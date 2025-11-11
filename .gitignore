@@ -1,0 +1,7 @@
+outputs/*
+!outputs/.gitkeep
+logs/*
+!logs/.gitkeep
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
